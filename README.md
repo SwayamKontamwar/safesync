@@ -1,56 +1,97 @@
 # SafeSync
 
-SafeSync is a deliberately narrow local two-way folder synchronizer. It supports
-regular-file creation and modification, hash-based conflict detection, atomic
-replacement, persistent operation journaling, and idempotent crash recovery.
-Deletion propagation, rename detection, symbolic links, and metadata sync are
-intentionally unsupported.
+SafeSync is a deliberately narrow, Windows-only local two-way folder
+synchronizer. It supports regular-file creation and modification, SHA-256-based
+change detection, conflict preservation, same-directory atomic replacement,
+persistent journaling, and idempotent process-crash recovery.
+
+Deletion propagation, rename detection, symbolic links, junctions, permissions,
+and metadata synchronization are intentionally unsupported. Do not use this
+alpha release as the only copy of valuable data.
+
+## Install
 
 ```powershell
-python -m safesync LEFT_DIRECTORY RIGHT_DIRECTORY --dry-run --verbose
-python -m safesync LEFT_DIRECTORY RIGHT_DIRECTORY --verbose
-python -m unittest discover -v
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install .
 ```
 
-State, journal, and deterministic conflict copies live under `.safesync` in the
-left selected root. Both roots must already exist, must not overlap, and may not
-be symbolic links.
+## Workflow
+
+Both roots must already exist, be disposable while evaluating the tool, and be
+distinct non-overlapping directories.
+
+```powershell
+safesync init C:\sync-left C:\sync-right
+safesync dry-run C:\sync-left C:\sync-right
+safesync --verbose sync C:\sync-left C:\sync-right
+safesync inspect C:\sync-left C:\sync-right
+safesync recover C:\sync-left C:\sync-right
+```
+
+`init` binds state to the exact canonical root pair without copying files.
+`sync` first recovers journaled work and then synchronizes current changes.
+`dry-run` plans without creating control files or changing either root.
+`inspect` reports state count, pending journal operations, conflicts, and temp
+files. `recover` explicitly resumes an interrupted synchronization and finishes
+the resulting plan.
+
+State, configuration, the operation journal, the process lock, and deterministic
+conflict copies live under `.safesync` in the left root. Successful synchronization
+compacts committed journal entries after the state file is atomically replaced.
 
 ## Safety invariants
 
-- A destination is replaced only after a complete same-directory temporary copy
-  has been flushed and its SHA-256 hash verified.
-- A completed source file is never opened for writing.
-- Independently changed contents are never used to overwrite one another; both
-  are retained at their original paths and as deterministic conflict copies.
-- Every accessed path is relative to and revalidated beneath an explicitly
-  selected root. Symlink traversal is refused.
-- Recovery operations are content-addressed and journaled. Repeating recovery
-  converges without creating additional files.
-- Missing files that were previously recorded are treated as unsupported
-  deletions and stop propagation for that path.
-- Ambiguous or inconsistent journal, source, or destination content stops the
-  operation instead of guessing.
+- Source files are read-only to SafeSync and are rehashed after copying.
+- A destination is replaced only after a same-directory temp copy is flushed and
+  its SHA-256 hash is verified.
+- The destination's planned prior hash or planned absence is journaled and checked
+  again immediately before replacement.
+- Independently changed originals remain in place and both exact contents are
+  stored at deterministic conflict paths.
+- Every operation path is relative to a selected root. Root overlap, traversal,
+  symlinks, junctions, reparse points, Windows reserved names, trailing dots or
+  spaces, alternate data-stream syntax, and case-insensitive collisions stop.
+- One writer lock protects state and journal transitions.
+- Malformed, truncated, unsupported, or internally inconsistent metadata stops
+  before synchronization guesses.
+- A previously recorded file that becomes absent is treated as an unsupported
+  deletion. Neither side nor its prior state record is changed.
+- Recovery operation IDs are derived from the complete intended transition.
+  Repeating recovery converges without additional conflict files.
 
-## Classification limits
+## Classification
 
-A path absent from prior state and present on one side is a new file. A path
-recorded as present and now missing is a deletion, which is reported and not
-propagated. Renames are intentionally not inferred: without stable filesystem
-identity or rename history, a rename is represented as one unsupported deletion
-plus one creation. Modifications are changes to the content hash at the same
-relative path.
+A path absent from prior state and present on one side is a creation. A recorded
+path that becomes absent is an unsupported deletion and is refused. A content
+hash change at the same relative path is a modification. Renames are not inferred:
+they appear as one refused deletion and one creation.
 
-A true conflict means both sides' current hashes independently differ from their
-last successful hashes and differ from each other. A repeated recovery has the
-same deterministic operation ID, expected hash, and destination; the journal or
-already-matching destination makes it a no-op.
+A conflict means both current hashes independently differ from the last successful
+left and right hashes and from each other. A recovery attempt is recognized by its
+deterministic operation ID, source hash, destination precondition, and destination.
 
-## Crash injection
+## Verification
 
-Tests can pause a worker by setting `SAFESYNC_PAUSE_POINT` and passing a localhost
-signal port in `SAFESYNC_PAUSE_PORT`. After the worker reaches the named point it
-signals the parent and waits. The parent verifies that the worker is still alive,
-forcibly terminates it, and verifies the nonzero process result. Named points are
-`after_journal_prepared`, `after_temp_fsync`, `after_atomic_replace`, and
-`after_journal_commit`.
+```powershell
+python -m unittest -v
+python -m tests.crash_evidence
+```
+
+The suite uses real temporary directories, real copying and replacement, Windows
+file locks and junctions, misleading timestamps, deterministic randomized files,
+and parent-forced worker termination. Named checkpoints are
+`after_journal_prepared`, `during_temp_copy`, `after_temp_fsync`,
+`after_atomic_replace`, and `after_journal_commit`.
+The state/journal ordering boundary `after_state_commit` is also externally killed
+in the recovery matrix.
+
+## Limits
+
+The tests demonstrate recovery from process termination on the tested Windows
+filesystem. They do not prove durability across machine power loss, storage
+controller cache loss, filesystem corruption, failing hardware, kernel failure,
+or a hostile process changing a destination in the final instant between the
+precondition check and `os.replace`. Windows does not expose a portable Python
+directory-fsync guarantee equivalent to durable directory entry flushing on some
+Unix filesystems.

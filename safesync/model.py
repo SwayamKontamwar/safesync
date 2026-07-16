@@ -40,6 +40,7 @@ class JournalOperation:
     destination_side: str
     destination_relative: str
     expected_hash: str
+    destination_prior_hash: str | None
     temp_name: str
     status: str = OperationStatus.PREPARED
 
@@ -59,6 +60,7 @@ class PlannedOperation:
     destination_side: str
     destination_relative: str
     expected_hash: str
+    destination_prior_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -72,4 +74,3 @@ class Roots:
         if side == "right":
             return self.right
         raise ValueError(f"invalid side: {side}")
-

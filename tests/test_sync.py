@@ -17,17 +17,21 @@ from safesync import SyncEngine
 from safesync.filesystem import SafetyError, sha256_file
 
 
-def _spawned_worker(left: str, right: str, point: str, port: int, stdout_path: str, stderr_path: str) -> None:
+def _spawned_worker(
+    left: str, right: str, point: str, port: int, stdout_path: str, stderr_path: str, resume: bool = False
+) -> None:
     os.environ["SAFESYNC_PAUSE_POINT"] = point
     os.environ["SAFESYNC_PAUSE_PORT"] = str(port)
+    if resume:
+        os.environ["SAFESYNC_RESUME_AFTER_SIGNAL"] = "1"
     with open(stdout_path, "w", encoding="utf-8") as stdout, open(stderr_path, "w", encoding="utf-8") as stderr:
         logging.basicConfig(stream=stderr, level=logging.INFO, format="%(levelname)s %(message)s", force=True)
         try:
             result = SyncEngine(Path(left), Path(right)).sync()
             print(json.dumps(asdict(result), sort_keys=True), file=stdout, flush=True)
-        except BaseException:
+        except Exception:
             logging.exception("worker failed")
-            raise
+            raise SystemExit(2)
 
 
 class SyncTestCase(unittest.TestCase):
@@ -53,7 +57,7 @@ class SyncTestCase(unittest.TestCase):
         environment.pop("SAFESYNC_PAUSE_POINT", None)
         environment.pop("SAFESYNC_PAUSE_PORT", None)
         return subprocess.run(
-            [sys.executable, "-m", "safesync", str(self.left), str(self.right), "--verbose"],
+            [sys.executable, "-m", "safesync", "--verbose", "sync", str(self.left), str(self.right)],
             cwd=Path(__file__).parents[1], env=environment, text=True,
             capture_output=True, timeout=15, check=False,
         )
@@ -90,6 +94,39 @@ class SyncTestCase(unittest.TestCase):
         stderr = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
         completed = subprocess.CompletedProcess(["multiprocessing", point], process.exitcode, stdout, stderr)
         return completed, signal, was_running, worker_pid, killed_exit_code
+
+    def run_worker_through_gate(self, point: str, action) -> subprocess.CompletedProcess[str]:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(15)
+            stdout_path = self.base / "gate.stdout.log"
+            stderr_path = self.base / "gate.stderr.log"
+            process = multiprocessing.get_context("spawn").Process(
+                target=_spawned_worker,
+                args=(str(self.left), str(self.right), point, listener.getsockname()[1],
+                      str(stdout_path), str(stderr_path), True),
+            )
+            process.start()
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    signal = connection.makefile("r", encoding="ascii").readline().strip()
+                    self.assertEqual(int(signal.split()[0]), process.pid)
+                    self.assertEqual(signal.split()[1], point)
+                    self.assertTrue(process.is_alive())
+                    action()
+                    connection.sendall(b"1")
+                process.join(timeout=15)
+                if process.is_alive():
+                    raise RuntimeError("resumed worker did not terminate")
+            finally:
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=15)
+        stdout = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
+        stderr = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+        return subprocess.CompletedProcess(["multiprocessing", point], process.exitcode, stdout, stderr)
 
     def test_one_way_creation_uses_verified_atomic_copy(self) -> None:
         source = self.write(self.left, "folder/data.bin", b"complete payload" * 1000)
@@ -183,7 +220,7 @@ class SyncTestCase(unittest.TestCase):
         self.assertNotEqual(after_kill, after_recovery_one)
         self.assertEqual(after_recovery_one, after_recovery_two)
         self.assertEqual({}, self._snapshot_diff(after_recovery_one, after_recovery_two))
-        self.assertEqual({"committed"}, {entry["status"] for entry in self._journal()["operations"].values()})
+        self.assertEqual({}, self._journal()["operations"])
         self.assertFalse(json.loads(unchanged.stdout)["changed"])
 
     def test_previous_presence_distinguishes_deletion_and_stops(self) -> None:
@@ -328,14 +365,13 @@ class SyncTestCase(unittest.TestCase):
         record = state["files"][relative]
         self.assertEqual(record["left_hash"], sha256_file(self.left / relative))
         self.assertEqual(record["right_hash"], sha256_file(self.right / relative))
-        journal = self._journal()
-        conflict_entries = [entry for entry in journal["operations"].values() if entry["kind"] == "preserve_conflict"]
-        self.assertEqual(2, len(conflict_entries))
-        for entry in conflict_entries:
-            self.assertEqual(entry["status"], "committed")
-            destination = self.left / Path(entry["destination_relative"])
-            self.assertTrue(destination.is_file())
-            self.assertEqual(entry["expected_hash"], sha256_file(destination))
+        self.assertEqual({}, self._journal()["operations"])
+        conflict_files = self._conflict_files(self._tree_snapshot())
+        self.assertEqual(2, len(conflict_files))
+        self.assertCountEqual(
+            [record["left_hash"], record["right_hash"]],
+            [hashlib.sha256(content).hexdigest() for content in conflict_files.values()],
+        )
 
 
 if __name__ == "__main__":
