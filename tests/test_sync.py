@@ -62,7 +62,7 @@ class SyncTestCase(unittest.TestCase):
             capture_output=True, timeout=15, check=False,
         )
 
-    def kill_worker_at(self, point: str) -> tuple[subprocess.CompletedProcess[str], str, bool, int, int]:
+    def kill_worker_at(self, point: str, action=None) -> tuple[subprocess.CompletedProcess[str], str, bool, int, int]:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
@@ -81,6 +81,8 @@ class SyncTestCase(unittest.TestCase):
                     signal = connection.makefile("r", encoding="ascii").readline().strip()
                 worker_pid = int(signal.split()[0])
                 was_running = process.is_alive()
+                if action is not None:
+                    action()
                 process.kill()
                 process.join(timeout=15)
                 if process.is_alive():

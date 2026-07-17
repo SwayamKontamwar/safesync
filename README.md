@@ -127,6 +127,12 @@ misleading timestamps; duplicate contents with distinct identities; a 1,000-imag
 directory rename; editor temp-file/flush/rename replacement; an actively writing
 second process; event-loss full-scan fallback; Windows locks, junctions, and path
 boundaries; and parent-forced worker termination followed by two recoveries.
+The combined crash/concurrency matrix enumerates create, change, confirmed
+delete, and move in both directions at every checkpoint reachable by that
+operation. At each checkpoint two real writer threads change a synchronized file
+independently on both sides before the parent kills the worker; recovery must
+retain each writer's bytes exactly once and recovery two must match the complete
+snapshot byte for byte.
 
 Named crash checkpoints are `after_journal_prepared`, `during_temp_copy`,
 `after_temp_fsync`, `after_atomic_replace`, `after_delete_backup`,

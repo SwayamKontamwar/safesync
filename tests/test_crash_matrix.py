@@ -319,6 +319,75 @@ class ConcurrencyCrossProductTests(unittest.TestCase):
         self.assertEqual(1, list(conflicts.values()).count(first))
         self.assertEqual(1, list(conflicts.values()).count(second))
 
+    def test_two_writers_survive_every_operation_crash_checkpoint(self) -> None:
+        matrix = {
+            "create": COPY_POINTS,
+            "change": COPY_POINTS,
+            "delete": DELETE_POINTS,
+            "move": MOVE_POINTS,
+        }
+        for operation, points in matrix.items():
+            for operation_side in ("left", "right"):
+                for point in points:
+                    with self.subTest(operation=operation, operation_side=operation_side, point=point):
+                        case = self.new_case()
+                        case.write(case.left, "sentinel.bin", b"sentinel baseline")
+                        engine = SyncEngine(case.left, case.right)
+                        if operation != "create":
+                            case.write(case.left, "old.bin", b"operation baseline")
+                        engine.sync()
+                        operation_root = case.left if operation_side == "left" else case.right
+                        if operation == "create":
+                            (operation_root / "new.bin").write_bytes(b"created")
+                        elif operation == "change":
+                            (operation_root / "old.bin").write_bytes(b"changed")
+                        elif operation == "delete":
+                            (operation_root / "old.bin").unlink()
+                            engine.confirm_deletion(operation_side, "old.bin")
+                        else:
+                            os.replace(operation_root / "old.bin", operation_root / "new.bin")
+
+                        left_writer = f"left-writer-{operation}-{operation_side}-{point}".encode()
+                        right_writer = f"right-writer-{operation}-{operation_side}-{point}".encode()
+
+                        def write_both() -> None:
+                            barrier = __import__("threading").Barrier(3)
+
+                            def write(path, content):
+                                barrier.wait()
+                                path.write_bytes(content)
+
+                            threads = [
+                                __import__("threading").Thread(
+                                    target=write, args=(case.left / "sentinel.bin", left_writer)
+                                ),
+                                __import__("threading").Thread(
+                                    target=write, args=(case.right / "sentinel.bin", right_writer)
+                                ),
+                            ]
+                            for thread in threads:
+                                thread.start()
+                            barrier.wait()
+                            for thread in threads:
+                                thread.join()
+
+                        killed, signal, alive, worker_pid, exit_code = case.kill_worker_at(point, write_both)
+                        self.assertTrue(alive)
+                        self.assertEqual(int(signal.split()[0]), worker_pid)
+                        self.assertLess(exit_code, 0)
+                        self.assertNotEqual(killed.returncode, 0)
+                        first_recovery = case.run_worker()
+                        self.assertEqual(0, first_recovery.returncode, first_recovery.stderr)
+                        after_first = case._tree_snapshot()
+                        second_recovery = case.run_worker()
+                        self.assertEqual(0, second_recovery.returncode, second_recovery.stderr)
+                        self.assertEqual(after_first, case._tree_snapshot())
+                        self.assertEqual(left_writer, (case.left / "sentinel.bin").read_bytes())
+                        self.assertEqual(right_writer, (case.right / "sentinel.bin").read_bytes())
+                        conflicts = case._conflict_files(after_first)
+                        self.assertEqual(1, list(conflicts.values()).count(left_writer))
+                        self.assertEqual(1, list(conflicts.values()).count(right_writer))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
