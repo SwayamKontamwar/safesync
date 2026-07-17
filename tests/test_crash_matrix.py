@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from pathlib import Path
@@ -292,6 +293,31 @@ class ConcurrencyCrossProductTests(unittest.TestCase):
         self.assertCountEqual(
             [b"left concurrent", b"right concurrent"], case._conflict_files(case._tree_snapshot()).values()
         )
+
+    def test_writer_after_operation_commit_cannot_be_marked_last_good(self) -> None:
+        case = self.new_case()
+        first = b"first writer" * 200000
+        second = b"second writer after commit"
+        case.write(case.left, "late.bin", first)
+        result = case.run_worker_through_gate(
+            "after_journal_commit", lambda: (case.right / "late.bin").write_bytes(second)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing state commit", result.stderr)
+        self.assertEqual((case.left / "late.bin").read_bytes(), first)
+        self.assertEqual((case.right / "late.bin").read_bytes(), second)
+        state_path = case.left / ".safesync/state.json"
+        if state_path.exists():
+            self.assertEqual({}, json.loads(state_path.read_text(encoding="utf-8"))["files"])
+
+        recovery = case.run_worker()
+        self.assertEqual(0, recovery.returncode, recovery.stderr)
+        after_first = case._tree_snapshot()
+        self.assertEqual(0, case.run_worker().returncode)
+        self.assertEqual(after_first, case._tree_snapshot())
+        conflicts = case._conflict_files(after_first)
+        self.assertEqual(1, list(conflicts.values()).count(first))
+        self.assertEqual(1, list(conflicts.values()).count(second))
 
 
 if __name__ == "__main__":

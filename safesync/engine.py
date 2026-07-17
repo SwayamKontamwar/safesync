@@ -468,6 +468,7 @@ class SyncEngine:
         if not self.dry_run:
             final_left = scan_tree(self.roots.left)
             final_right = scan_tree(self.roots.right)
+            self._verify_final_tree(left_files, right_files, operations, final_left, final_right)
             next_records = {
                 relative: SyncRecord(
                     final_left[relative].content_hash if relative in final_left else None,
@@ -496,6 +497,40 @@ class SyncEngine:
             skipped=skipped,
             changed=bool(operations or recovered),
         )
+
+    def _verify_final_tree(self, initial_left, initial_right, operations, final_left, final_right) -> None:
+        expected = {
+            "left": {path: item.content_hash for path, item in initial_left.items()},
+            "right": {path: item.content_hash for path, item in initial_right.items()},
+        }
+        for operation in operations:
+            destination = expected[operation.destination_side]
+            if operation.kind == OperationKind.COPY:
+                destination[operation.destination_relative] = operation.expected_hash
+            elif operation.kind == OperationKind.DELETE:
+                destination.pop(operation.destination_relative, None)
+            elif operation.kind == OperationKind.MOVE:
+                destination.pop(operation.move_source_relative or operation.source_relative, None)
+                destination[operation.destination_relative] = operation.expected_hash
+            elif operation.kind == OperationKind.MOVE_TREE:
+                old_prefix = (operation.move_source_relative or operation.source_relative).rstrip("/")
+                new_prefix = operation.destination_relative.rstrip("/")
+                moved = {
+                    path: content_hash
+                    for path, content_hash in destination.items()
+                    if path == old_prefix or path.startswith(old_prefix + "/")
+                }
+                for path, content_hash in moved.items():
+                    del destination[path]
+                    suffix = path[len(old_prefix):].lstrip("/")
+                    destination[f"{new_prefix}/{suffix}" if suffix else new_prefix] = content_hash
+
+        actual = {
+            "left": {path: item.content_hash for path, item in final_left.items()},
+            "right": {path: item.content_hash for path, item in final_right.items()},
+        }
+        if actual != expected:
+            raise SafetyError("filesystem changed during synchronization; refusing state commit")
 
     def _copy(
         self, source: str, destination: str, relative: str, content_hash: str, destination_prior_hash: str | None

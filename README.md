@@ -13,6 +13,8 @@ independent backup of valuable data.
 
 - Windows with NTFS or another local filesystem that supplies stable file IDs
 - CPython 3.11, 3.12, or 3.13
+- `python.exe` available as `python` on `PATH` (select **Add python.exe to
+  PATH** in the Windows Python installer)
 - Two existing, distinct, non-overlapping local directories
 
 Symbolic links, junctions, reparse points, permissions, alternate data streams,
@@ -24,6 +26,7 @@ and cloud-placeholder directories are outside the verified scope.
 From a fresh clone in PowerShell:
 
 ```powershell
+python --version
 python -m venv .venv-clean
 .venv-clean\Scripts\python.exe -m pip install --upgrade pip
 .venv-clean\Scripts\python.exe -m pip install -e .
