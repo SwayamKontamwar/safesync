@@ -168,6 +168,17 @@ class SyncTestCase(unittest.TestCase):
         self.assertEqual(right_file.read_bytes(), b"left changed")
         self.assertEqual(result.conflicts, 0)
 
+    def test_unchanged_sync_does_not_replace_state_file(self) -> None:
+        self.write(self.left, "stable.txt", b"stable")
+        engine = SyncEngine(self.left, self.right)
+        engine.sync()
+        before = engine.state_path.stat()
+        self.assertFalse(engine.sync().changed)
+        after = engine.state_path.stat()
+        self.assertEqual(before.st_ino, after.st_ino)
+        self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
+        self.assertFalse((engine.control / ".state.json.tmp").exists())
+
     def test_independent_changes_preserve_both_and_retry_is_idempotent(self) -> None:
         left_file = self.write(self.left, "shared.txt", b"baseline")
         SyncEngine(self.left, self.right).sync()

@@ -483,8 +483,9 @@ class SyncEngine:
             for relative in tombstones:
                 next_records[relative] = SyncRecord(None, None, tombstone=True)
             next_records.update(state_overrides)
-            self._save_state(next_records)
-            self._pause_for_external_kill("after_state_commit")
+            if next_records != records or not self.state_path.exists():
+                self._save_state(next_records)
+                self._pause_for_external_kill("after_state_commit")
             if consumed_intents:
                 remaining = {key: value for key, value in intents.items() if key not in consumed_intents}
                 self._save_intents(remaining)
