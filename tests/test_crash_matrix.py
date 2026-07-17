@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 
 from safesync import SyncEngine
 from tests.test_sync import SyncTestCase
@@ -24,6 +25,14 @@ DELETE_POINTS = (
 )
 MOVE_POINTS = (
     "after_journal_prepared",
+    "after_move_destination",
+    "after_move_unlink",
+    "after_journal_commit",
+    "after_state_commit",
+)
+TREE_MOVE_POINTS = (
+    "after_journal_prepared",
+    "during_move_tree",
     "after_move_destination",
     "after_move_unlink",
     "after_journal_commit",
@@ -139,6 +148,67 @@ class CrashCrossProductTests(unittest.TestCase):
         snapshot = case._tree_snapshot()
         self.assertFalse(engine.sync().changed)
         self.assertEqual(snapshot, case._tree_snapshot())
+
+    def test_directory_move_each_side_at_every_reachable_crash_point(self) -> None:
+        for side in ("left", "right"):
+            for point in TREE_MOVE_POINTS:
+                with self.subTest(side=side, point=point):
+                    case = self.new_case()
+                    expected = {}
+                    for number in range(4):
+                        content = f"image-{side}-{point}-{number}".encode()
+                        relative = f"photos/image-{number}.jpg"
+                        expected[relative] = content
+                        case.write(case.left, relative, content)
+                        case.write(case.right, relative, content)
+                    engine = SyncEngine(case.left, case.right)
+                    engine.sync()
+                    root = case.left if side == "left" else case.right
+                    os.replace(root / "photos", root / "archive")
+
+                    killed, signal, alive, worker_pid, exit_code = case.kill_worker_at(point)
+                    self.assertTrue(alive)
+                    self.assertEqual(int(signal.split()[0]), worker_pid)
+                    self.assertLess(exit_code, 0)
+                    self.assertNotEqual(killed.returncode, 0)
+                    self.assertEqual(case.run_worker().returncode, 0)
+                    after_first = case._tree_snapshot()
+                    self.assertEqual(case.run_worker().returncode, 0)
+                    self.assertEqual(after_first, case._tree_snapshot())
+                    for current_root in (case.left, case.right):
+                        self.assertFalse((current_root / "photos").exists())
+                        for relative, content in expected.items():
+                            filename = Path(relative).name
+                            self.assertEqual((current_root / "archive" / filename).read_bytes(), content)
+
+    def test_delete_versus_edit_each_direction_at_every_copy_crash_point(self) -> None:
+        for deleted_side in ("left", "right"):
+            for point in COPY_POINTS:
+                with self.subTest(deleted_side=deleted_side, point=point):
+                    case = self.new_case()
+                    case.write(case.left, "contested.bin", b"baseline")
+                    engine = SyncEngine(case.left, case.right)
+                    engine.sync()
+                    deleted_root = case.left if deleted_side == "left" else case.right
+                    edited_root = case.right if deleted_side == "left" else case.left
+                    edited = f"independent-{deleted_side}-{point}".encode()
+                    (deleted_root / "contested.bin").unlink()
+                    (edited_root / "contested.bin").write_bytes(edited)
+                    engine.confirm_deletion(deleted_side, "contested.bin")
+
+                    killed, signal, alive, worker_pid, exit_code = case.kill_worker_at(point)
+                    self.assertTrue(alive)
+                    self.assertEqual(int(signal.split()[0]), worker_pid)
+                    self.assertLess(exit_code, 0)
+                    self.assertNotEqual(killed.returncode, 0)
+                    self.assertEqual(case.run_worker().returncode, 0)
+                    after_first = case._tree_snapshot()
+                    self.assertEqual(case.run_worker().returncode, 0)
+                    self.assertEqual(after_first, case._tree_snapshot())
+                    self.assertFalse((deleted_root / "contested.bin").exists())
+                    self.assertEqual((edited_root / "contested.bin").read_bytes(), edited)
+                    conflicts = case._conflict_files(after_first)
+                    self.assertEqual(1, list(conflicts.values()).count(edited))
 
 
 class ConcurrencyCrossProductTests(unittest.TestCase):
