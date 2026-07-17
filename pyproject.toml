@@ -3,6 +3,7 @@ name = "safesync"
 version = "0.2.0"
 description = "A deliberately small, local, data-preserving folder synchronizer"
 requires-python = ">=3.11"
+dependencies = ["watchdog>=6,<7"]
 license = {text = "MIT"}
 readme = "README.md"
 classifiers = [

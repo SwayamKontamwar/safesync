@@ -59,7 +59,8 @@ def stable_file_observation(path: Path, relative: str) -> FileObservation:
     identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
     if identity_before != identity_after:
         raise SafetyError(f"file changed while being observed: {path}")
-    return FileObservation(relative, content_hash, after.st_size, after.st_mtime_ns)
+    identity = f"{after.st_dev:x}:{after.st_ino:x}"
+    return FileObservation(relative, content_hash, after.st_size, after.st_mtime_ns, identity)
 
 
 def validate_roots(left: Path, right: Path) -> tuple[Path, Path]:

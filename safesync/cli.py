@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .engine import CRASH_POINTS, SyncEngine
 from .filesystem import SafetyError
+from .watcher import WatchService
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,10 +21,18 @@ def parser() -> argparse.ArgumentParser:
         ("dry-run", "plan synchronization without changing either root"),
         ("inspect", "show state, journal, conflict, and temporary-file status"),
         ("recover", "recover pending work and finish the interrupted synchronization"),
+        ("delete", "confirm an already-performed deletion and synchronize it"),
+        ("watch", "watch both roots and reconcile settled changes continuously"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("left", type=Path)
         command.add_argument("right", type=Path)
+        if name == "delete":
+            command.add_argument("side", choices=("left", "right"))
+            command.add_argument("path")
+        if name == "watch":
+            command.add_argument("--settle", type=float, default=1.0)
+            command.add_argument("--full-scan", type=float, default=30.0)
     result.epilog = "named crash points: " + ", ".join(CRASH_POINTS)
     return result
 
@@ -36,12 +45,18 @@ def main() -> int:
     )
     try:
         engine = SyncEngine(args.left, args.right, dry_run=args.command == "dry-run")
+        if args.command == "watch":
+            WatchService(args.left, args.right, settle_seconds=args.settle, full_scan_seconds=args.full_scan).run()
+            return 0
         if args.command == "init":
             output = {"initialized": engine.initialize()}
         elif args.command == "inspect":
             output = asdict(engine.inspect())
         elif args.command == "recover":
             output = asdict(engine.recover())
+        elif args.command == "delete":
+            intent = engine.confirm_deletion(args.side, args.path)
+            output = {"intent": intent.to_dict(), "result": asdict(engine.sync())}
         else:
             output = asdict(engine.sync())
     except (SafetyError, OSError, ValueError) as exc:

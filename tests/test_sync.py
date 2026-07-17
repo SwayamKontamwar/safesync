@@ -233,7 +233,7 @@ class SyncTestCase(unittest.TestCase):
         with self.assertLogs("safesync", level="WARNING") as captured:
             result = SyncEngine(self.left, self.right).sync()
         after_refusal = self._tree_snapshot()
-        self.assertIn("skip ambiguous deletion path=kept.txt", "\n".join(captured.output))
+        self.assertIn("skip unconfirmed deletion path=kept.txt side=left", "\n".join(captured.output))
         self.assertFalse((self.left / "kept.txt").exists())
         self.assertEqual((self.right / "kept.txt").read_bytes(), b"content")
         self.assertEqual(sha256_file(self.right / "kept.txt"), original_hash)
@@ -338,11 +338,13 @@ class SyncTestCase(unittest.TestCase):
         self.assertEqual({}, self._snapshot_diff(after_recovery_one, after_recovery_two))
         self._assert_journal_state_disk_agree("payload.bin")
 
-    def _tree_snapshot(self) -> dict[str, bytes]:
+    def _tree_snapshot(self, *, exclude_live_lock: bool = False) -> dict[str, bytes]:
         result = {}
         for side_name, root in (("left", self.left), ("right", self.right)):
             for path in sorted(root.rglob("*")):
                 if path.is_file():
+                    if exclude_live_lock and path == self.left / ".safesync" / "lock":
+                        continue
                     result[f"{side_name}/{path.relative_to(root).as_posix()}"] = path.read_bytes()
         return result
 

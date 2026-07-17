@@ -119,7 +119,7 @@ class MetadataAndRecoveryTests(SyncTestCase):
         SyncEngine(self.left, self.right).initialize()
         self.write(self.left, "safe.txt", b"safe")
         (self.left / ".safesync/journal.json").write_text(
-            json.dumps({"version": 2, "operations": {"bad": {"status": "mystery"}}}), encoding="utf-8"
+            json.dumps({"version": 3, "operations": {"bad": {"status": "mystery"}}}), encoding="utf-8"
         )
         before = self._tree_snapshot()
         with self.assertRaisesRegex(SafetyError, "invalid journal operation"):
@@ -130,14 +130,14 @@ class MetadataAndRecoveryTests(SyncTestCase):
     def test_truncated_journal_and_tampered_config_stop_safely(self) -> None:
         engine = SyncEngine(self.left, self.right)
         engine.initialize()
-        engine.journal_path.write_bytes(b'{"version": 2, "operations":')
+        engine.journal_path.write_bytes(b'{"version": 3, "operations":')
         before = self._tree_snapshot()
         with self.assertRaisesRegex(SafetyError, "invalid metadata"):
             engine.sync()
         self.assertEqual(before, self._tree_snapshot())
-        engine.journal_path.write_text('{"operations": {}, "version": 2}\n', encoding="utf-8")
+        engine.journal_path.write_text('{"operations": {}, "version": 3}\n', encoding="utf-8")
         engine.config_path.write_text(
-            json.dumps({"version": 2, "left": str(self.left), "right": str(self.base / "elsewhere")}),
+            json.dumps({"version": 3, "left": str(self.left), "right": str(self.base / "elsewhere")}),
             encoding="utf-8",
         )
         before_config_check = self._tree_snapshot()
@@ -171,6 +171,7 @@ class MetadataAndRecoveryTests(SyncTestCase):
         self.assertLess(engine.journal_path.stat().st_size, 100)
 
 
+@unittest.skipUnless(os.name == "nt", "Windows filesystem boundary test")
 class WindowsBoundaryTests(SyncTestCase):
     def test_cross_root_case_collision_stops_before_copy(self) -> None:
         self.write(self.left, "Report.txt", b"left")
