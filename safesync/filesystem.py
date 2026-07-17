@@ -120,6 +120,8 @@ def scan_tree(root: Path) -> dict[str, FileObservation]:
             if is_reparse_point(path):
                 raise SafetyError(f"reparse points are unsupported: {path}")
         for name in sorted(filenames):
+            if name.startswith(".safesync-tmp-"):
+                continue
             path = directory_path / name
             file_stat = path.lstat()
             if stat.S_ISLNK(file_stat.st_mode):
