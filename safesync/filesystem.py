@@ -4,9 +4,17 @@ import hashlib
 import json
 import os
 import stat
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
+
+
+_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_METADATA_LOCKS: dict[str, threading.RLock] = {}
+_METADATA_LOCKS_GUARD = threading.Lock()
 
 from .model import FileObservation
 
@@ -130,63 +138,86 @@ def scan_tree(root: Path) -> dict[str, FileObservation]:
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.tmp")
-    if is_reparse_point(path.parent) or (temp.exists() and is_reparse_point(temp)):
-        raise SafetyError(f"metadata path contains a reparse point: {path}")
-    data = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    with temp.open("wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temp, path)
+    with _metadata_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(f".{path.name}.tmp")
+        if is_reparse_point(path.parent) or (temp.exists() and is_reparse_point(temp)):
+            raise SafetyError(f"metadata path contains a reparse point: {path}")
+        data = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        with temp.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                os.replace(temp, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
 
 
 def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            value = json.load(stream)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise SafetyError(f"invalid metadata file: {path}") from exc
+    with _metadata_lock(path):
+        if not path.exists():
+            return default
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                value = json.load(stream)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise SafetyError(f"invalid metadata file: {path}") from exc
     if not isinstance(value, dict):
         raise SafetyError(f"metadata root must be an object: {path}")
     return value
 
 
 @contextmanager
-def exclusive_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if is_reparse_point(path.parent) or (path.exists() and is_reparse_point(path)):
-        raise SafetyError(f"lock path contains a reparse point: {path}")
-    stream = path.open("a+b")
-    locked = False
-    try:
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
-        stream.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-        except OSError as exc:
-            raise SafetyError("another SafeSync process holds the selected roots") from exc
+def _metadata_lock(path: Path) -> Iterator[None]:
+    key = str(path.resolve(strict=False)).casefold()
+    with _METADATA_LOCKS_GUARD:
+        lock = _METADATA_LOCKS.setdefault(key, threading.RLock())
+    with lock:
         yield
-    finally:
+
+
+@contextmanager
+def exclusive_lock(path: Path) -> Iterator[None]:
+    key = str(path.resolve(strict=False)).casefold()
+    with _PROCESS_LOCKS_GUARD:
+        process_lock = _PROCESS_LOCKS.setdefault(key, threading.RLock())
+    with process_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if is_reparse_point(path.parent) or (path.exists() and is_reparse_point(path)):
+            raise SafetyError(f"lock path contains a reparse point: {path}")
+        stream = path.open("a+b")
+        locked = False
         try:
-            if locked:
-                stream.seek(0)
+            if stream.tell() == 0:
+                stream.write(b"0")
+                stream.flush()
+            stream.seek(0)
+            try:
                 if os.name == "nt":
                     import msvcrt
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError as exc:
+                raise SafetyError("another SafeSync process holds the selected roots") from exc
+            yield
         finally:
-            stream.close()
+            try:
+                if locked:
+                    stream.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                stream.close()

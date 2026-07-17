@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
@@ -21,12 +22,15 @@ from .filesystem import (
     validate_roots,
 )
 from .model import (
+    ConflictCase,
+    ConflictVersion,
     JournalOperation,
     DeletionIntent,
     OperationKind,
     OperationStatus,
     PlannedOperation,
     Roots,
+    ResolutionResult,
     SyncRecord,
 )
 
@@ -44,6 +48,11 @@ CRASH_POINTS = (
     "after_move_destination",
     "after_move_unlink",
     "during_move_tree",
+    "after_resolution_intent",
+    "after_resolution_journal_prepared",
+    "after_resolution_operation",
+    "after_resolution_state_commit",
+    "after_resolution_commit",
 )
 
 
@@ -81,6 +90,8 @@ class SyncEngine:
         self.state_path = self.control / "state.json"
         self.journal_path = self.control / "journal.json"
         self.intents_path = self.control / "deletions.json"
+        self.resolutions_path = self.control / "resolutions.json"
+        self.operations_path = self.control / "operations.json"
         self.lock_path = self.control / "lock"
 
     def initialize(self) -> bool:
@@ -93,6 +104,10 @@ class SyncEngine:
                     atomic_write_json(self.journal_path, {"version": STATE_VERSION, "operations": {}})
                 if not self.intents_path.exists():
                     atomic_write_json(self.intents_path, {"version": STATE_VERSION, "intents": {}})
+                if not self.resolutions_path.exists():
+                    atomic_write_json(self.resolutions_path, {"version": STATE_VERSION, "transactions": {}})
+                if not self.operations_path.exists():
+                    atomic_write_json(self.operations_path, {"version": STATE_VERSION, "events": []})
                 return False
             if self.state_path.exists() or self.journal_path.exists():
                 raise SafetyError("state or journal exists without root-pair configuration")
@@ -100,6 +115,8 @@ class SyncEngine:
             atomic_write_json(self.state_path, {"version": STATE_VERSION, "files": {}})
             atomic_write_json(self.journal_path, {"version": STATE_VERSION, "operations": {}})
             atomic_write_json(self.intents_path, {"version": STATE_VERSION, "intents": {}})
+            atomic_write_json(self.resolutions_path, {"version": STATE_VERSION, "transactions": {}})
+            atomic_write_json(self.operations_path, {"version": STATE_VERSION, "events": []})
             return True
 
     def confirm_deletion(self, side: str, relative: str, *, evidence: str = "explicit") -> DeletionIntent:
@@ -177,6 +194,227 @@ class SyncEngine:
             )),
         )
 
+    def list_conflicts(self) -> tuple[ConflictCase, ...]:
+        with exclusive_lock(self.lock_path):
+            self._verify_config()
+            self._recover_journal()
+            self._recover_resolutions_locked()
+            return self._list_conflicts_locked()
+
+    def _list_conflicts_locked(self) -> tuple[ConflictCase, ...]:
+        records = self._load_state()
+        root = self.control / "conflicts"
+        if not root.exists():
+            return ()
+        cases: list[ConflictCase] = []
+        for directory, names, filenames in os.walk(root, topdown=True, followlinks=False):
+            current = Path(directory)
+            if is_reparse_point(current):
+                raise SafetyError("conflict storage contains a reparse point")
+            if names or not filenames:
+                continue
+            files = [current / name for name in sorted(filenames)]
+            if any(is_reparse_point(path) for path in files):
+                raise SafetyError("conflict storage contains a reparse point")
+            group_relative = current.relative_to(root).as_posix()
+            parts = PurePosixPath(group_relative).parts
+            is_move = bool(parts and parts[0] == "moves")
+            target = None if is_move else "/".join(parts[:-1])
+            deleted_side = None
+            versions: list[ConflictVersion] = []
+            for path in files:
+                label = path.name
+                content_hash = sha256_file(path)
+                if label.startswith("edited-") and "-delete-" in label:
+                    side = label[len("edited-"):].split("-delete-", 1)[0]
+                else:
+                    side = "left" if "left" in label else "right" if "right" in label else "unknown"
+                preferred = target
+                if "-delete-" in label:
+                    deleted_side = label.rsplit("-delete-", 1)[1]
+                if is_move:
+                    candidates = []
+                    for relative, record in records.items():
+                        if not record.move_conflict:
+                            continue
+                        side_hash = record.left_hash if side == "left" else record.right_hash
+                        if side_hash == content_hash:
+                            candidates.append(relative)
+                    preferred = candidates[0] if len(candidates) == 1 else None
+                versions.append(ConflictVersion(
+                    label=label,
+                    side=side,
+                    stored_relative=path.relative_to(self.roots.left).as_posix(),
+                    content_hash=content_hash,
+                    size=path.stat().st_size,
+                    preferred_path=preferred,
+                ))
+            if is_move:
+                matching = [version for version in versions if version.preferred_path is not None]
+                if not matching:
+                    continue
+                paths = {item.preferred_path for item in matching if item.preferred_path}
+                open_case = any(records[path].move_conflict for path in paths)
+                resolvable = len(matching) >= 2 and all(item.side in {"left", "right"} for item in matching)
+                kind = "move"
+                display = " / ".join(sorted(paths))
+                reason = None if resolvable else "move conflict paths cannot be mapped uniquely to stored versions"
+            else:
+                record = records.get(target or "")
+                if record is None:
+                    continue
+                open_case = bool(
+                    record.move_conflict or record.left_deleted or record.right_deleted
+                    or record.left_hash != record.right_hash
+                )
+                kind = "delete" if deleted_side else "content"
+                display = target or group_relative
+                resolvable = (
+                    len(versions) == 1 and versions[0].side in {"left", "right"}
+                    if deleted_side else {item.side for item in versions} >= {"left", "right"}
+                )
+                reason = None if resolvable else "stored conflict versions are incomplete or ambiguous"
+            if not open_case:
+                continue
+            cases.append(ConflictCase(
+                conflict_id=hashlib.sha256(group_relative.encode()).hexdigest()[:16],
+                kind=kind,
+                display_path=display,
+                versions=tuple(versions),
+                deleted_side=deleted_side,
+                resolvable=resolvable,
+                reason=reason,
+            ))
+        return tuple(sorted(cases, key=lambda item: (item.display_path, item.conflict_id)))
+
+    def resolve_conflict(self, conflict_id: str, choice: str) -> ResolutionResult:
+        if choice not in {"left", "right", "keep_both"}:
+            raise SafetyError(f"unsupported conflict resolution choice: {choice}")
+        with exclusive_lock(self.lock_path):
+            self._verify_config()
+            recovered = self._recover_journal()
+            recovered += self._recover_resolutions_locked()
+            case = {item.conflict_id: item for item in self._list_conflicts_locked()}.get(conflict_id)
+            if case is None:
+                raise SafetyError(f"conflict is no longer open: {conflict_id}")
+            if not case.resolvable:
+                raise SafetyError(case.reason or f"conflict cannot be resolved safely: {conflict_id}")
+            operations, expected, affected = self._plan_resolution(case, choice)
+            transaction_id = hashlib.sha256(
+                (f"resolve\0{case.conflict_id}\0{choice}\0" + "\0".join(
+                    self._operation_id(operation) for operation in operations
+                )).encode()
+            ).hexdigest()[:24]
+            transactions = self._load_resolutions()
+            if transaction_id in transactions:
+                raise SafetyError(f"resolution transaction already exists: {transaction_id}")
+            transaction = {
+                "transaction_id": transaction_id,
+                "conflict_id": case.conflict_id,
+                "choice": choice,
+                "status": "prepared",
+                "operations": [asdict(operation) for operation in operations],
+                "expected": expected,
+                "affected_paths": sorted(affected),
+            }
+            transactions[transaction_id] = transaction
+            self._save_resolutions(transactions)
+            self._pause_for_external_kill("after_resolution_intent")
+            self._prepare_and_finish_batch(operations)
+            self._finalize_resolution(transaction, transactions)
+            return ResolutionResult(transaction_id, conflict_id, choice, len(operations), recovered)
+
+    def _plan_resolution(self, case: ConflictCase, choice: str):
+        current = {"left": scan_tree(self.roots.left), "right": scan_tree(self.roots.right)}
+        operations: list[PlannedOperation] = []
+        expected: dict[str, dict[str, str | None]] = {"left": {}, "right": {}}
+        affected: set[str] = set()
+
+        def copy(version: ConflictVersion, side: str, relative: str) -> None:
+            prior = current[side].get(relative)
+            operations.append(PlannedOperation(
+                OperationKind.RESOLVE_COPY, "left", version.stored_relative, side, relative,
+                version.content_hash, prior.content_hash if prior else None,
+            ))
+            expected[side][relative] = version.content_hash
+            affected.add(relative)
+
+        def delete(side: str, relative: str) -> None:
+            prior = current[side].get(relative)
+            if prior is not None:
+                operations.append(PlannedOperation(
+                    OperationKind.DELETE, side, relative, side, relative, prior.content_hash,
+                    prior.content_hash,
+                    backup_relative=f"{CONTROL_DIRECTORY}/trash/resolutions/{case.conflict_id}/{side}/{relative}",
+                ))
+            expected[side][relative] = None
+            affected.add(relative)
+
+        by_side = {version.side: version for version in case.versions if version.side in {"left", "right"}}
+        if case.kind == "content":
+            selected = by_side.get("left" if choice == "keep_both" else choice)
+            if selected is None:
+                raise SafetyError(f"selected conflict side is unavailable: {choice}")
+            destination_order = ("right", "left") if selected.side == "left" else ("left", "right")
+            for side in destination_order:
+                copy(selected, side, case.display_path)
+            if choice == "keep_both":
+                for version in (by_side["left"], by_side["right"]):
+                    alternate = self._conflict_alternate(case.display_path, version.side, case.conflict_id)
+                    for side in ("left", "right"):
+                        copy(version, side, alternate)
+        elif case.kind == "delete":
+            survivor = case.versions[0]
+            if choice == survivor.side:
+                destination_order = ("right", "left") if survivor.side == "left" else ("left", "right")
+                for side in destination_order:
+                    copy(survivor, side, case.display_path)
+            elif choice == case.deleted_side:
+                for side in ("left", "right"):
+                    delete(side, case.display_path)
+            elif choice == "keep_both":
+                alternate = self._conflict_alternate(case.display_path, survivor.side, case.conflict_id)
+                for side in ("left", "right"):
+                    copy(survivor, side, alternate)
+                    delete(side, case.display_path)
+            else:
+                raise SafetyError(f"selected conflict side is unavailable: {choice}")
+        else:
+            selected = by_side.get("left" if choice == "keep_both" else choice)
+            if selected is None or selected.preferred_path is None:
+                raise SafetyError(f"selected move version is unavailable: {choice}")
+            if choice == "keep_both":
+                used_paths: set[str] = set()
+                for version in (by_side["left"], by_side["right"]):
+                    target = version.preferred_path
+                    if target is None:
+                        raise SafetyError("move conflict path is ambiguous")
+                    if target in used_paths:
+                        target = self._conflict_alternate(target, version.side, case.conflict_id)
+                    used_paths.add(target)
+                    for side in ("left", "right"):
+                        copy(version, side, target)
+            else:
+                target = selected.preferred_path
+                for side in ("left", "right"):
+                    copy(selected, side, target)
+                for other in {item.preferred_path for item in case.versions if item.preferred_path != target}:
+                    if other:
+                        for side in ("left", "right"):
+                            delete(side, other)
+        for relative in affected:
+            for side in ("left", "right"):
+                observation = current[side].get(relative)
+                expected[side].setdefault(relative, observation.content_hash if observation else None)
+        return operations, expected, affected
+
+    @staticmethod
+    def _conflict_alternate(relative: str, side: str, conflict_id: str) -> str:
+        path = PurePosixPath(relative)
+        suffix = path.suffix
+        stem = path.name[:-len(suffix)] if suffix else path.name
+        return str(path.with_name(f"{stem}.safesync-{side}-{conflict_id[:8]}{suffix}"))
+
     def recover(self) -> SyncResult:
         return self.sync()
 
@@ -222,6 +460,8 @@ class SyncEngine:
 
     def _sync_locked(self) -> SyncResult:
         recovered = 0 if self.dry_run else self._recover_journal()
+        if not self.dry_run:
+            recovered += self._recover_resolutions_locked()
         left_files = scan_tree(self.roots.left)
         right_files = scan_tree(self.roots.right)
         folded_paths: dict[str, str] = {}
@@ -506,7 +746,7 @@ class SyncEngine:
         }
         for operation in operations:
             destination = expected[operation.destination_side]
-            if operation.kind == OperationKind.COPY:
+            if operation.kind in {OperationKind.COPY, OperationKind.RESOLVE_COPY}:
                 destination[operation.destination_relative] = operation.expected_hash
             elif operation.kind == OperationKind.DELETE:
                 destination.pop(operation.destination_relative, None)
@@ -737,7 +977,10 @@ class SyncEngine:
         if entry.kind == OperationKind.MOVE_TREE:
             self._finish_move_tree(entry, journal)
             return
-        source = guarded_path(self.roots.get(entry.source_side), entry.source_relative)
+        source = guarded_path(
+            self.roots.get(entry.source_side), entry.source_relative,
+            allow_control=entry.kind == OperationKind.RESOLVE_COPY,
+        )
         destination = guarded_path(
             self.roots.get(entry.destination_side), entry.destination_relative, allow_control=True
         )
@@ -765,6 +1008,10 @@ class SyncEngine:
         if entry.status == OperationStatus.TEMP_WRITTEN:
             if destination.exists() and sha256_file(destination) == entry.expected_hash:
                 LOGGER.info("replacement already visible operation=%s", entry.operation_id)
+                if temp.exists():
+                    if sha256_file(temp) != entry.expected_hash:
+                        raise SafetyError(f"pending temporary file is corrupt: {temp}")
+                    temp.unlink()
             else:
                 self._verify_destination_precondition(destination, entry.destination_prior_hash)
                 if not temp.exists() or sha256_file(temp) != entry.expected_hash:
@@ -775,6 +1022,7 @@ class SyncEngine:
                 raise SafetyError(f"atomic replacement verification failed: {destination}")
             entry.status = OperationStatus.COMMITTED
             self._save_journal(journal)
+            self._record_operation("operation_committed", entry)
             self._pause_for_external_kill("after_journal_commit")
 
     def _finish_delete(self, entry: JournalOperation, journal: dict[str, JournalOperation]) -> None:
@@ -810,6 +1058,7 @@ class SyncEngine:
                 self._pause_for_external_kill("after_delete_unlink")
             entry.status = OperationStatus.COMMITTED
             self._save_journal(journal)
+            self._record_operation("operation_committed", entry)
             self._pause_for_external_kill("after_journal_commit")
 
     def _finish_move(self, entry: JournalOperation, journal: dict[str, JournalOperation]) -> None:
@@ -848,6 +1097,7 @@ class SyncEngine:
                 self._pause_for_external_kill("after_move_unlink")
             entry.status = OperationStatus.COMMITTED
             self._save_journal(journal)
+            self._record_operation("operation_committed", entry)
             self._pause_for_external_kill("after_journal_commit")
 
     def _finish_move_tree(self, entry: JournalOperation, journal: dict[str, JournalOperation]) -> None:
@@ -888,6 +1138,7 @@ class SyncEngine:
                 self._pause_for_external_kill("after_move_unlink")
             entry.status = OperationStatus.COMMITTED
             self._save_journal(journal)
+            self._record_operation("operation_committed", entry)
             self._pause_for_external_kill("after_journal_commit")
 
     def _recover_journal(self) -> int:
@@ -900,6 +1151,91 @@ class SyncEngine:
             self._finish_entry(entry, journal)
             recovered += 1
         return recovered
+
+    def _prepare_and_finish_batch(self, operations: list[PlannedOperation]) -> None:
+        journal = self._load_journal()
+        added = False
+        entries: list[JournalOperation] = []
+        for operation in operations:
+            operation_id = self._operation_id(operation)
+            entry = journal.get(operation_id)
+            if entry is None:
+                destination = guarded_path(
+                    self.roots.get(operation.destination_side), operation.destination_relative,
+                    allow_control=True,
+                )
+                self._verify_destination_precondition(destination, operation.destination_prior_hash)
+                entry = JournalOperation(
+                    operation_id=operation_id,
+                    kind=operation.kind,
+                    source_side=operation.source_side,
+                    source_relative=operation.source_relative,
+                    destination_side=operation.destination_side,
+                    destination_relative=operation.destination_relative,
+                    expected_hash=operation.expected_hash,
+                    destination_prior_hash=operation.destination_prior_hash,
+                    temp_name=f".safesync-tmp-{operation_id}",
+                    backup_relative=operation.backup_relative,
+                    move_source_relative=operation.move_source_relative,
+                )
+                journal[operation_id] = entry
+                added = True
+            entries.append(entry)
+        if added:
+            self._save_journal(journal)
+            self._pause_for_external_kill("after_resolution_journal_prepared")
+        for entry in entries:
+            if entry.status != OperationStatus.COMMITTED:
+                self._finish_entry(entry, journal)
+                self._pause_for_external_kill("after_resolution_operation")
+
+    def _recover_resolutions_locked(self) -> int:
+        transactions = self._load_resolutions()
+        recovered = 0
+        for transaction in transactions.values():
+            if transaction["status"] == "committed":
+                continue
+            operations = [PlannedOperation(**value) for value in transaction["operations"]]
+            self._prepare_and_finish_batch(operations)
+            self._finalize_resolution(transaction, transactions)
+            recovered += 1
+        return recovered
+
+    def _finalize_resolution(self, transaction, transactions) -> None:
+        observations = {"left": scan_tree(self.roots.left), "right": scan_tree(self.roots.right)}
+        for side in ("left", "right"):
+            for relative, expected_hash in transaction["expected"][side].items():
+                current = observations[side].get(relative)
+                current_hash = current.content_hash if current else None
+                if current_hash != expected_hash:
+                    raise SafetyError(
+                        f"resolution destination changed before state commit: {side}:{relative}"
+                    )
+        records = self._load_state()
+        for relative in transaction["affected_paths"]:
+            left = observations["left"].get(relative)
+            right = observations["right"].get(relative)
+            if left is None and right is None:
+                records[relative] = SyncRecord(None, None, tombstone=True)
+            else:
+                records[relative] = SyncRecord(
+                    left.content_hash if left else None,
+                    right.content_hash if right else None,
+                    left.identity if left else None,
+                    right.identity if right else None,
+                )
+        self._save_state(records)
+        self._pause_for_external_kill("after_resolution_state_commit")
+        transaction["status"] = "committed"
+        transactions[transaction["transaction_id"]] = transaction
+        self._save_resolutions(transactions)
+        self._record_event("resolution_committed", {
+            "transaction_id": transaction["transaction_id"],
+            "conflict_id": transaction["conflict_id"],
+            "choice": transaction["choice"],
+        })
+        self._pause_for_external_kill("after_resolution_commit")
+        self._compact_journal()
 
     def _load_state(self) -> dict[str, SyncRecord]:
         payload = load_json(self.state_path, {"version": STATE_VERSION, "files": {}})
@@ -949,7 +1285,10 @@ class SyncEngine:
                 raise SafetyError(f"invalid journal hash: {operation_id}")
             if entry.temp_name != f".safesync-tmp-{operation_id}":
                 raise SafetyError(f"invalid journal operation identity: {operation_id}")
-            guarded_path(self.roots.get(entry.source_side), entry.source_relative)
+            guarded_path(
+                self.roots.get(entry.source_side), entry.source_relative,
+                allow_control=entry.kind == OperationKind.RESOLVE_COPY,
+            )
             guarded_path(self.roots.get(entry.destination_side), entry.destination_relative, allow_control=True)
             planned = PlannedOperation(
                 OperationKind(entry.kind), entry.source_side, entry.source_relative,
@@ -986,6 +1325,172 @@ class SyncEngine:
             "version": STATE_VERSION,
             "intents": {key: value.to_dict() for key, value in sorted(intents.items())},
         })
+
+    def _load_resolutions(self) -> dict[str, dict]:
+        payload = load_json(self.resolutions_path, {"version": STATE_VERSION, "transactions": {}})
+        transactions = payload.get("transactions")
+        if (
+            payload.get("version") != STATE_VERSION
+            or set(payload) != {"version", "transactions"}
+            or not isinstance(transactions, dict)
+        ):
+            raise SafetyError("invalid resolution-transaction schema")
+        required = {
+            "transaction_id", "conflict_id", "choice", "status", "operations",
+            "expected", "affected_paths",
+        }
+        for key, transaction in transactions.items():
+            if not isinstance(transaction, dict) or set(transaction) != required:
+                raise SafetyError(f"invalid resolution transaction: {key}")
+            if (
+                key != transaction["transaction_id"]
+                or transaction["status"] not in {"prepared", "committed"}
+                or transaction["choice"] not in {"left", "right", "keep_both"}
+                or not isinstance(transaction["operations"], list)
+                or not isinstance(transaction["affected_paths"], list)
+                or set(transaction["expected"] if isinstance(transaction["expected"], dict) else ())
+                != {"left", "right"}
+            ):
+                raise SafetyError(f"invalid resolution transaction: {key}")
+            try:
+                operations = [PlannedOperation(**value) for value in transaction["operations"]]
+            except (TypeError, AttributeError) as exc:
+                raise SafetyError(f"invalid resolution operations: {key}") from exc
+            expected_id = hashlib.sha256(
+                (f"resolve\0{transaction['conflict_id']}\0{transaction['choice']}\0" + "\0".join(
+                    self._operation_id(operation) for operation in operations
+                )).encode()
+            ).hexdigest()[:24]
+            if expected_id != key:
+                raise SafetyError(f"resolution transaction ID does not match contents: {key}")
+            affected = set(transaction["affected_paths"])
+            if not affected:
+                raise SafetyError(f"resolution transaction has no affected paths: {key}")
+            for relative in affected:
+                guarded_path(self.roots.left, relative)
+            for side in ("left", "right"):
+                values = transaction["expected"][side]
+                if not isinstance(values, dict) or set(values) != affected:
+                    raise SafetyError(f"resolution expected-path set is invalid: {key}")
+                for relative, content_hash in values.items():
+                    if content_hash is not None and not self._valid_hash(content_hash):
+                        raise SafetyError(f"resolution expected hash is invalid: {key}:{relative}")
+        return transactions
+
+    def _save_resolutions(self, transactions: dict[str, dict]) -> None:
+        atomic_write_json(self.resolutions_path, {
+            "version": STATE_VERSION,
+            "transactions": {key: value for key, value in sorted(transactions.items())},
+        })
+
+    def _record_operation(self, event: str, entry: JournalOperation) -> None:
+        self._record_event(event, {
+            "operation_id": entry.operation_id,
+            "kind": str(entry.kind),
+            "source": f"{entry.source_side}:{entry.source_relative}",
+            "destination": f"{entry.destination_side}:{entry.destination_relative}",
+            "expected_hash": entry.expected_hash,
+        })
+
+    def _record_event(self, event: str, details: dict) -> None:
+        payload = load_json(self.operations_path, {"version": STATE_VERSION, "events": []})
+        events = payload.get("events")
+        if payload.get("version") != STATE_VERSION or set(payload) != {"version", "events"} or not isinstance(events, list):
+            raise SafetyError("invalid operation-log schema")
+        events.append({"timestamp_ns": time.time_ns(), "event": event, **details})
+        atomic_write_json(self.operations_path, {"version": STATE_VERSION, "events": events[-1000:]})
+
+    def operation_events(self) -> tuple[dict, ...]:
+        with exclusive_lock(self.lock_path):
+            self._verify_config()
+            payload = load_json(self.operations_path, {"version": STATE_VERSION, "events": []})
+            events = payload.get("events")
+            if payload.get("version") != STATE_VERSION or set(payload) != {"version", "events"} or not isinstance(events, list):
+                raise SafetyError("invalid operation-log schema")
+            return tuple(events)
+
+    def dashboard_snapshot(self) -> dict:
+        # Metadata files are atomically replaced. A read-only live view must not
+        # wait behind the writer lock or it could never display mid-operation state.
+        with nullcontext():
+            self._verify_config()
+            left_files = scan_tree(self.roots.left)
+            right_files = scan_tree(self.roots.right)
+            records = self._load_state()
+            journal = self._load_journal()
+            conflicts = self._list_conflicts_locked()
+            conflict_paths = {
+                path
+                for conflict in conflicts
+                for path in (
+                    [conflict.display_path]
+                    if conflict.kind != "move"
+                    else [version.preferred_path for version in conflict.versions if version.preferred_path]
+                )
+            }
+            pending_paths = {
+                relative
+                for entry in journal.values()
+                if entry.status != OperationStatus.COMMITTED
+                for relative in (entry.source_relative, entry.destination_relative, entry.move_source_relative)
+                if relative and not relative.startswith(CONTROL_DIRECTORY + "/")
+            }
+            files = []
+            for relative in sorted(set(left_files) | set(right_files) | set(records)):
+                left = left_files.get(relative)
+                right = right_files.get(relative)
+                record = records.get(relative)
+                if relative in pending_paths:
+                    status = "mid_operation"
+                elif relative in conflict_paths or (
+                    record and (record.move_conflict or record.left_deleted or record.right_deleted)
+                ):
+                    status = "conflict"
+                elif left and right and left.content_hash == right.content_hash:
+                    status = "in_sync"
+                elif left and right:
+                    status = "different"
+                elif left:
+                    status = "left_only"
+                elif right:
+                    status = "right_only"
+                else:
+                    status = "deleted"
+
+                def view(observation):
+                    if observation is None:
+                        return None
+                    return {
+                        "sha256": observation.content_hash,
+                        "size": observation.size,
+                        "modified_ns": observation.modified_ns,
+                        "identity": observation.identity,
+                    }
+
+                files.append({"path": relative, "status": status, "left": view(left), "right": view(right)})
+            operations_payload = load_json(
+                self.operations_path, {"version": STATE_VERSION, "events": []}
+            )
+            return {
+                "roots": {"left": str(self.roots.left), "right": str(self.roots.right)},
+                "files": files,
+                "conflicts": [asdict(conflict) for conflict in conflicts],
+                "journal": {
+                    "version": STATE_VERSION,
+                    "operations": {key: value.to_dict() for key, value in sorted(journal.items())},
+                },
+                "state": {
+                    "version": STATE_VERSION,
+                    "files": {key: asdict(value) for key, value in sorted(records.items())},
+                },
+                "operation_log": operations_payload.get("events", [])[-200:],
+                "temporary_files": [
+                    f"{side}:{path.relative_to(root).as_posix()}"
+                    for side, root in (("left", self.roots.left), ("right", self.roots.right))
+                    for path in sorted(root.rglob(".safesync-tmp-*"))
+                    if path.is_file()
+                ],
+            }
 
     def _compact_journal(self) -> None:
         journal = self._load_journal()

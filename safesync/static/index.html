@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="safesync-token" content="__SAFESYNC_TOKEN__">
+  <title>SafeSync</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true">S</div>
+      <div><strong>SafeSync</strong><span id="connection">Connecting</span></div>
+    </div>
+    <div class="root-pair">
+      <div><span>LEFT</span><code id="left-root"></code></div>
+      <div class="pair-arrow" aria-hidden="true">&#8644;</div>
+      <div><span>RIGHT</span><code id="right-root"></code></div>
+    </div>
+    <div class="actions">
+      <button id="sync-button" class="button secondary" type="button">Sync now</button>
+      <button id="watch-button" class="button primary" type="button">Start watch</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="summary" aria-label="Synchronization summary">
+      <div><span class="metric-value" id="count-sync">0</span><span class="metric-label">In sync</span></div>
+      <div><span class="metric-value warning" id="count-active">0</span><span class="metric-label">Active</span></div>
+      <div><span class="metric-value danger" id="count-conflict">0</span><span class="metric-label">Conflicts</span></div>
+      <div><span class="metric-value" id="count-total">0</span><span class="metric-label">Tracked</span></div>
+      <div class="last-refresh"><span>UPDATED</span><time id="updated">-</time></div>
+    </section>
+
+    <nav class="tabs" aria-label="Workspace views">
+      <button class="tab active" data-tab="files" type="button">Files</button>
+      <button class="tab" data-tab="conflicts" type="button">Conflicts <span id="conflict-badge">0</span></button>
+      <button class="tab" data-tab="activity" type="button">Activity</button>
+      <button class="tab" data-tab="journal" type="button">Journal &amp; state</button>
+    </nav>
+
+    <section id="view-files" class="view active">
+      <div class="view-toolbar">
+        <label class="search"><span aria-hidden="true">&#9906;</span><input id="file-search" type="search" placeholder="Filter paths" aria-label="Filter paths"></label>
+        <select id="status-filter" aria-label="Filter by status">
+          <option value="all">All statuses</option>
+          <option value="in_sync">In sync</option>
+          <option value="mid_operation">Mid operation</option>
+          <option value="conflict">Conflict</option>
+          <option value="left_only">Left only</option>
+          <option value="right_only">Right only</option>
+          <option value="different">Different</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Path</th><th>Status</th><th>Left</th><th>Right</th></tr></thead>
+          <tbody id="file-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="view-conflicts" class="view">
+      <div id="conflict-list" class="conflict-list"></div>
+      <div id="conflict-empty" class="empty-state">No open conflicts</div>
+    </section>
+
+    <section id="view-activity" class="view">
+      <div class="activity-grid">
+        <section><h2>Filesystem events</h2><ol id="watch-events" class="event-list"></ol></section>
+        <section><h2>Operations</h2><ol id="operation-events" class="event-list"></ol></section>
+      </div>
+    </section>
+
+    <section id="view-journal" class="view">
+      <div class="metadata-grid">
+        <section><h2>Journal</h2><pre id="journal-json"></pre></section>
+        <section><h2>State</h2><pre id="state-json"></pre></section>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

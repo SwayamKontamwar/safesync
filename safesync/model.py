@@ -12,6 +12,7 @@ class OperationKind(StrEnum):
     DELETE = "delete"
     MOVE = "move"
     MOVE_TREE = "move_tree"
+    RESOLVE_COPY = "resolve_copy"
 
 
 class OperationStatus(StrEnum):
@@ -94,6 +95,36 @@ class DeletionIntent:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ConflictVersion:
+    label: str
+    side: str
+    stored_relative: str
+    content_hash: str
+    size: int
+    preferred_path: str | None
+
+
+@dataclass(frozen=True)
+class ConflictCase:
+    conflict_id: str
+    kind: str
+    display_path: str
+    versions: tuple[ConflictVersion, ...]
+    deleted_side: str | None = None
+    resolvable: bool = True
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolutionResult:
+    transaction_id: str
+    conflict_id: str
+    choice: str
+    operations: int
+    recovered: int
 
 
 @dataclass(frozen=True)

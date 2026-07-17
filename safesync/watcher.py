@@ -4,6 +4,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +62,12 @@ class WatchService:
         self.full_scan_seconds = full_scan_seconds
         self.events: queue.Queue[WatchEvent] = queue.Queue()
         self._force_full_scan = threading.Event()
+        self._history: deque[dict] = deque(maxlen=500)
+        self._history_lock = threading.Lock()
+
+    def recent_events(self) -> list[dict]:
+        with self._history_lock:
+            return list(self._history)
 
     def notify_overflow(self) -> None:
         LOGGER.warning("filesystem event stream overflowed; scheduling full reconciliation")
@@ -91,6 +98,14 @@ class WatchService:
                         event = self.events.get_nowait()
                     except queue.Empty:
                         break
+                    with self._history_lock:
+                        self._history.append({
+                            "timestamp_ns": time.time_ns(),
+                            "side": event.side,
+                            "kind": event.kind,
+                            "source": event.source,
+                            "destination": event.destination,
+                        })
                     dirty_at = now
                     if event.kind == "deleted":
                         deletion_candidates[(event.side, event.source)] = now

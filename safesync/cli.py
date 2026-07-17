@@ -23,6 +23,7 @@ def parser() -> argparse.ArgumentParser:
         ("recover", "recover pending work and finish the interrupted synchronization"),
         ("delete", "confirm an already-performed deletion and synchronize it"),
         ("watch", "watch both roots and reconcile settled changes continuously"),
+        ("ui", "open the live local SafeSync interface"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("left", type=Path)
@@ -33,6 +34,9 @@ def parser() -> argparse.ArgumentParser:
         if name == "watch":
             command.add_argument("--settle", type=float, default=1.0)
             command.add_argument("--full-scan", type=float, default=30.0)
+        if name == "ui":
+            command.add_argument("--port", type=int, default=0)
+            command.add_argument("--no-browser", action="store_true")
     result.epilog = "named crash points: " + ", ".join(CRASH_POINTS)
     return result
 
@@ -45,6 +49,10 @@ def main() -> int:
     )
     try:
         engine = SyncEngine(args.left, args.right, dry_run=args.command == "dry-run")
+        if args.command == "ui":
+            from .web import serve_ui
+            serve_ui(args.left, args.right, args.port, open_browser=not args.no_browser)
+            return 0
         if args.command == "watch":
             WatchService(args.left, args.right, settle_seconds=args.settle, full_scan_seconds=args.full_scan).run()
             return 0
